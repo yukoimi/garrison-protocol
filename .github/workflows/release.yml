@@ -34,15 +34,20 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onefile --name "GarrisonProtocol" `
+          pyinstaller --onedir --noconsole --name "GarrisonProtocol" `
             --add-data "game/assets;game/assets" `
+            --hidden-import arcade `
             --collect-all arcade `
-            game/main.py
+            --copy-metadata arcade `
+            run.py
+
+      - name: Package release zip
+        run: Compress-Archive -Path dist/GarrisonProtocol/* -DestinationPath dist/GarrisonProtocol.zip
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: ${{ steps.version.outputs.version }}
-          files: dist/GarrisonProtocol.exe
+          files: dist/GarrisonProtocol.zip
           generate_release_notes: true
