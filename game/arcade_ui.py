@@ -1,5 +1,5 @@
 """卫戍协议 - Arcade UI (完全重写)"""
-import math, random
+import math, random, threading
 from typing import Optional
 import arcade
 
@@ -18,10 +18,8 @@ from .engine import GameState, PactLayerEngine, get_round_funds, get_shop_operat
 from .map_gen import GameMap, CellType
 from .logic import BattleLogic
 
-_beep_enabled = True  # 战斗中关闭阻塞音效
 def beep(freq=800, ms=80):
-    if not _beep_enabled: return
-    try: winsound.Beep(freq, min(ms, 10))
+    try: threading.Thread(target=lambda: winsound.Beep(freq, int(ms)), daemon=True).start()
     except: pass
 
 # ── BGM ──
@@ -680,7 +678,6 @@ class GarrisonWindow(arcade.Window):
     def start_battle(self):
         if not self.state.deployed: self.msg='请至少部署1名干员!'; self.msg_tmr=2.0; return
         self.phase='battle'; self.b_dp=30; self.b_dp_tmr=0.0
-        global _beep_enabled; _beep_enabled = False  # 战斗中禁用阻塞音效
         play_bgm(bgm_battle)
         self.b_killed=self.b_leaked=0; self.b_speed=1.0; self.wave_tmr=0.0
         self.all_spawned=False; self.dmg_nums.clear(); self.atk_lines.clear()
@@ -870,7 +867,7 @@ class GarrisonWindow(arcade.Window):
                 self.atk_lines.append((op_px,op_py, best['x'], best['y'], 0.2))
                 self.dmg_nums.append((best['x'], best['y']-15, str(dmg), 1.0, GOLD))
                 if best['hp']<=0: best['alive']=False; best['blocked_by']=None; self.b_killed+=1
-                if best.get('is_boss'): beep(200, 300)
+                if best.get('is_boss'): beep(200, 80)
         self.enemies = [e for e in self.enemies if e['alive']]
         self.b_ops = [b for b in self.b_ops if b['alive'] or 'death_timer' in b]
         self.dmg_nums = [(x,y,t,tt-rd,c) for x,y,t,tt,c in self.dmg_nums if tt-rd>0]
@@ -879,7 +876,6 @@ class GarrisonWindow(arcade.Window):
 
     def _end_battle(self):
         self.phase='rest'; self.rest_tmr=0.0
-        global _beep_enabled; _beep_enabled = True  # 恢复音效
         play_bgm(bgm_rest)
         # 清除战斗特效
         self.dmg_nums.clear(); self.atk_lines.clear()
