@@ -485,22 +485,23 @@ class GarrisonWindow(arcade.Window):
 
     def refresh_shop(self):
         free = False
-        # 免费刷新次数(普罗旺斯等)
+        # 免费刷新次数(普罗旺斯等) —— 即使没钱也能用
         fr = getattr(self.state, 'free_refreshes', 0)
         if fr > 0:
             self.state.free_refreshes = fr - 1
             free = True
-        # 远见: 刷新时有概率免费
-        if not free:
+        else:
+            # 没钱就别想刷新了, 远见也不触发
+            if self.state.funds < self.state.refresh_cost:
+                self.msg = '资金不足!'; self.msg_tmr = 1.0; return
+            # 远见: 刷新时有概率免费
             foresight = self.state.pact_states.get('foresight')
             if foresight and foresight.active:
                 chance = (18 + 0.3 * foresight.layers) / 100.0
                 if random.random() < chance:
                     free = True
-        if not free:
-            if self.state.funds < self.state.refresh_cost:
-                self.msg = '资金不足!'; self.msg_tmr = 1.0; return
-            self.state.funds -= self.state.refresh_cost
+            if not free:
+                self.state.funds -= self.state.refresh_cost
         PactLayerEngine.trigger_refresh(self.state)
         self._refresh_shop()
         self.msg = '免费刷新!' if free else '刷新!'; self.msg_tmr = 1.0
@@ -705,8 +706,8 @@ class GarrisonWindow(arcade.Window):
             for eid, cnt in self.waves[wi].enemies:
                 t = ENEMIES.get(eid)
                 if t:
-                    # 随波次递增: 每波+15%HP, +10%ATK
-                    wave_scale = 1.0 + (wi * 0.06)
+                    # 随波次递增: 指数20%/波(1.20^波次), 前期平缓后期暴增
+                    wave_scale = 1.20 ** wi
                     for _ in range(cnt):
                         self.wave_q.append({'id':eid,'name':t.name,
                             'hp':int(t.hp*self.diff_mult*wave_scale),
@@ -892,6 +893,23 @@ class GarrisonWindow(arcade.Window):
                         c=self.gmap.get_cell(x,y)
                         if c and c.operator_id==op.uid: c.occupied=False; c.operator_id=""
         PactLayerEngine.trigger_rest_start(self.state); PactLayerEngine.trigger_rest_end(self.state)
+        # PREP特质: 休整期结束时
+        for op in self.state.roster:
+            for t in op.traits:
+                if t.trait_type == TraitType.PREP and t.trigger == TriggerType.ON_REST_END:
+                    td = t.description
+                    if '资金' in td:
+                        self.state.funds += 3
+                        self.msg = f'{op.name} 获得3资金!'; self.msg_tmr = 2.0
+                    elif '回复' in td:
+                        self.state.life = min(99, self.state.life + 2)
+                        self.msg = f'{op.name} 回复2点生命!'; self.msg_tmr = 2.0
+                    elif '随机' in td or '盟约' in td:
+                        active = [ps for ps in self.state.pact_states.values() if ps.active]
+                        if active:
+                            chosen = random.choice(active)
+                            chosen.layers += 5
+                            self.msg = f'{op.name}: 【{chosen.pact.name}】+5层!'; self.msg_tmr = 2.0
         self.msg=f'回合结束! 击杀{self.b_killed}/{self.b_total}'; self.msg_tmr=3.0
 
     def _next_round(self):
