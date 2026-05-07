@@ -1,0 +1,48 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [master, main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install arcade pyinstaller
+
+      - name: Generate version
+        id: version
+        shell: pwsh
+        run: |
+          $date = Get-Date -Format "yyyy.M.d"
+          $sha = git rev-parse --short HEAD
+          $ver = "v$date-$sha"
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+          echo "Version: $ver"
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --name "GarrisonProtocol" `
+            --add-data "game/assets;game/assets" `
+            --collect-all arcade `
+            game/main.py
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          files: dist/GarrisonProtocol.exe
+          generate_release_notes: true
