@@ -36,9 +36,7 @@ jobs:
         run: |
           pyinstaller --onedir --noconsole --name "GarrisonProtocol" `
             --add-data "game/assets;game/assets" `
-            --hidden-import arcade `
             --collect-all arcade `
-            --copy-metadata arcade `
             run.py
 
       - name: Package release zip
