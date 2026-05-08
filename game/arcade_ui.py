@@ -291,6 +291,8 @@ class GarrisonWindow(arcade.Window):
         self.center_lv = 1; self.temp_center_lv = 0
         self.center_upgrade_cost = 5
         self.frozen = False
+        self.kazimierz_buys = 0   # s10业务指标: 本回合卡西米尔购买次数
+        self.kjerag_bought = False  # s11雪域礼赠: 本回合是否已买过谢拉格
         self.selected: Optional[Operator] = None
         self.deploy_dir = 0    # 0=右 1=上 2=左 3=下
         # 拖拽部署
@@ -348,8 +350,11 @@ class GarrisonWindow(arcade.Window):
         self.state.round_num = 1
         self.center_lv = 1; self.center_upgrade_cost = 5
         self.shop_owned = [False]*5
-        self.frozen = False; self.selected = None
+        self.frozen = False; self.kazimierz_buys = 0; self.kjerag_bought = False
         self._give_funds(); self._refresh_shop()
+        # s9: 定向投放 - 升级费用减半
+        if strat.id == 's9':
+            self.center_upgrade_cost = max(1, self.center_upgrade_cost // 2)
         # s6: 开局获得随机VI阶干员
         if strat.id == 's6':
             t6 = [op for op in OPERATORS if op.tier == 6]
@@ -480,6 +485,17 @@ class GarrisonWindow(arcade.Window):
         if inv and inv.active:
             for _ in range((3 if inv.layers>=100 else 2)-1):
                 PactLayerEngine.trigger_obtain(self.state, op)
+        # s10: 业务指标 - 每购买【卡西米尔】+1资金(最多3/回合)
+        if self.state.strategy.id == 's10' and 'kazimierz' in op.pacts:
+            if self.kazimierz_buys < 3:
+                self.state.funds += 1
+                self.kazimierz_buys += 1
+                self.msg = f'业务指标: 返还1资金!'; self.msg_tmr = 2.0
+        # s11: 雪域礼赠 - 首位【谢拉格】返还1资金
+        if self.state.strategy.id == 's11' and 'kjerag' in op.pacts and not self.kjerag_bought:
+            self.state.funds += 1
+            self.kjerag_bought = True
+            self.msg = f'雪域礼赠: 返还1资金!'; self.msg_tmr = 2.0
         self._check_promotion()
         self.msg = f'获得 {op.name}'; self.msg_tmr = 1.5
 
@@ -921,6 +937,8 @@ class GarrisonWindow(arcade.Window):
         self._give_funds()
         if not self.frozen: self._refresh_shop()
         self.selected=None; self.drag_op=None; self.dir_mode=False; self.dir_op=None
+        self.kazimierz_buys = 0; self.kjerag_bought = False
+        self.temp_center_lv = 0  # 至简的临时等级仅持续本回合
         if self.state.round_num in (5,10,13): self.center_lv=min(6,self.center_lv+1)
         # s1: 每回合已激活盟约层数+8
         if self.state.strategy.id == 's1':
@@ -1041,6 +1059,8 @@ class GarrisonWindow(arcade.Window):
                 self.state.funds -= self.center_upgrade_cost
                 self.center_lv += 1
                 self.center_upgrade_cost = self.center_lv * 5
+                if self.state.strategy.id == 's9':
+                    self.center_upgrade_cost = max(1, self.center_upgrade_cost // 2)
                 self.msg = f'调度中心升级! Lv.{self.center_lv}'; self.msg_tmr = 2.0
             else: self.msg = '资金不足或已满级'; self.msg_tmr = 1.5
             return
@@ -1405,7 +1425,7 @@ class GarrisonWindow(arcade.Window):
             (f'回合 {self.state.round_num}/{self.state.total_waves}', TEXT, 15),
             (phases.get(self.phase, '?'), GOLD, 15),
             (f'HP {self.state.life}', RED if self.state.life<10 else GREEN, 15),
-            (f'Lv.{self.center_lv} | {self.state.difficulty}', DIM, 12),
+            (f'Lv.{self.center_lv}{"("+str(self.temp_center_lv-self.center_lv)+")" if self.temp_center_lv > self.center_lv else ""} | {self.state.difficulty}', DIM, 12),
         ]
         ix = MAP_L + 16
         for label, col, sz in info_parts:
