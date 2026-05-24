@@ -287,7 +287,7 @@ OPERATORS = [
     Operator(id="suguangxingyuan", name="溯光星源", tier=6, cost=12, pacts=["arcane","agility"], traits=[Trait(TraitType.STACK_CONTINUOUS, TriggerType.ON_REST_START, "arcane", 6, 12, "<进入休整期时>【奥术】层数+6(精锐+12)")], base_hp=1400, base_atk=680, base_def=120, atk_speed=1.6),
     Operator(id="huangwulapulande", name="荒芜拉普兰德", tier=6, cost=12, pacts=["siracusa"], traits=[Trait(TraitType.COMBAT, TriggerType.ON_COMBAT_START, "", 6, 12, "<战斗开始时>攻击+35%")], base_hp=1700, base_atk=720, base_def=160, atk_speed=1.2, block_count=2),
     Operator(id="jian", name="锏", tier=6, cost=12, pacts=["kjerag","kazimierz","agility"], traits=[Trait(TraitType.STACK_SINGLE, TriggerType.ON_COMBAT_START, "kjerag", 10, 20, "<战斗开始时>【谢拉格】层数+10(精锐+20, 单次)")], base_hp=1800, base_atk=700, base_def=180, atk_speed=1.0, block_count=2),
-    Operator(id="chunjinaiyafala", name="纯烬艾雅法拉", tier=6, cost=12, pacts=["assistance"], traits=[Trait(TraitType.COMBAT, TriggerType.ON_COMBAT_START, "", 6, 12, "<战斗开始时>全场每秒回复最大生命的2%")], base_hp=1200, base_atk=650, base_def=100, atk_speed=1.6, healer=True),
+    Operator(id="chunjinaiyafala", name="纯烬艾雅法拉", tier=6, cost=12, pacts=["assistance"], traits=[Trait(TraitType.COMBAT, TriggerType.ON_COMBAT_START, "", 6, 12, "<战斗开始时>攻击+30%")], base_hp=1200, base_atk=650, base_def=100, atk_speed=1.6, healer=True),
 ]
 
 OPS_BY_TIER = {i: [op for op in OPERATORS if op.tier == i] for i in range(1, 7)}

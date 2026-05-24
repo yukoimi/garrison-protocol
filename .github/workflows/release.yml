@@ -20,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install arcade pyinstaller
+        run: pip install arcade nuitka
 
       - name: Generate version
         id: version
@@ -32,17 +32,16 @@ jobs:
           echo "version=$ver" >> $env:GITHUB_OUTPUT
           echo "Version: $ver"
 
-      - name: Build with PyInstaller
-        run: |
-          pyinstaller --onedir --noconsole --name "GarrisonProtocol" `
-            --add-data "game/assets;game/assets" `
-            --hidden-import arcade `
-            --collect-submodules arcade `
-            --collect-binaries arcade `
-            run.py
+      - name: Build with Nuitka
+        run: >
+          nuitka --standalone --disable-console
+          --include-package=arcade
+          --include-data-dir=game/assets=game/assets
+          --output-dir=dist
+          run.py
 
       - name: Package release zip
-        run: Compress-Archive -Path dist/GarrisonProtocol/* -DestinationPath dist/GarrisonProtocol.zip
+        run: Compress-Archive -Path dist/run.dist/* -DestinationPath dist/GarrisonProtocol.zip
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
