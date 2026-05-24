@@ -1029,9 +1029,9 @@ class GarrisonWindow(arcade.Window):
                         op2.cost = tmpl.cost if tmpl else op.cost
                         self.state.roster.append(op2); self.state.bench.append(op2)
                         PactLayerEngine.trigger_obtain(self.state, op2)
+                        self.promo_ops = []
                         self._check_promotion()
                         self.msg = f'晋升奖励: {op2.name}!'; self.msg_tmr = 2.0
-                        self.promo_ops = []
                     return
 
         # 商店
