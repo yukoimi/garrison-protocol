@@ -34,7 +34,8 @@ jobs:
 
       - name: Build with Nuitka
         run: >
-          nuitka --standalone --disable-console
+          nuitka --standalone --windows-console-mode=disable
+          --assume-yes-for-downloads
           --include-package=arcade
           --include-data-dir=game/assets=game/assets
           --output-dir=dist
