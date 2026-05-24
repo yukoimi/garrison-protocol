@@ -22,6 +22,14 @@ jobs:
       - name: Install dependencies
         run: pip install arcade nuitka
 
+      - name: Cache Nuitka build
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka\Nuitka\Cache
+          key: ${{ runner.os }}-nuitka-v1
+          restore-keys: |
+            ${{ runner.os }}-nuitka-
+
       - name: Generate version
         id: version
         shell: pwsh
