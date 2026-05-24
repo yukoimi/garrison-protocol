@@ -25,7 +25,9 @@ jobs:
       - name: Cache Nuitka build
         uses: actions/cache@v4
         with:
-          path: ~\AppData\Local\Nuitka\Nuitka\Cache
+          path: |
+            ~\.cache\Nuitka
+            ~\AppData\Local\Nuitka\Nuitka
           key: ${{ runner.os }}-nuitka-v1
           restore-keys: |
             ${{ runner.os }}-nuitka-
