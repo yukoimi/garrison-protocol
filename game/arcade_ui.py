@@ -1,5 +1,5 @@
 """卫戍协议 - Arcade UI (完全重写)"""
-import math, random, threading
+import math, random, threading, socket
 from typing import Optional
 import arcade
 
@@ -13,6 +13,8 @@ def _asset(path):
     return os.path.join(base, path) if base else path
 
 from .models import Operator, TriggerType, TraitType
+from .network import NetManager
+import uuid as _uuid
 from .data import ALL_PACTS, OPERATORS, STRATEGIES, generate_waves, ENEMIES
 from .engine import GameState, PactLayerEngine, get_round_funds, get_shop_operators
 from .map_gen import GameMap, CellType
@@ -328,6 +330,43 @@ class GarrisonWindow(arcade.Window):
         self.setup_strat_idx = 0
         self.setup_diff_idx = 1
 
+        # ── 联机 ──
+        self.net_mode = 'single'       # single | host | client
+        self.net: Optional[NetManager] = None
+        self.player_id = -1
+        self.players: list[dict] = []  # [{id,name,hp,alive,ready}]
+        self.player_name = f'Player{random.randint(100,999)}'
+        self.host_port = 5555
+        self.client_host = '127.0.0.1'
+        self.lobby_ready = False
+        self._waiting_for_players = False
+        self._battle_ready = False
+        self._input_ip = ''           # IP输入缓存
+        self._input_mode = False      # 是否在IP输入状态
+        self._net_pending = []        # net.poll()缓存(每帧消费)
+        self._multiplayer_round = 0   # 当前联机回合序号
+        # 漏怪暂存(兜底)
+        self.leaked_enemies: list[dict] = []
+        self._backstop_enemies: list[dict] = []
+        self._is_backstop_player = False
+        self._is_spectating = False
+        self._backstop_round = False
+        self._backstop_done = False
+        # 兜底接力链 [A_id, B_id, ...] 同一批敌人各自独立防守
+        self._backstop_chain: list[int] = []
+        # Boss
+        self._boss_mode = False
+        self._boss_leaked_total = 0
+        # 策略选择
+        self._strat_picks: dict[int, str] = {}  # {player_id: strategy_id}
+        self._strat_selected = False
+        # 观战快照
+        self._spec_enemies: list[dict] = []
+        self._spec_operators: list[dict] = []
+        self._spec_killed = 0
+        self._spec_total = 0
+        self._spec_frame = 0
+
         play_bgm(bgm_main)  # 打开游戏即播放主界面BGM
 
     def _gen_decos(self):
@@ -339,12 +378,18 @@ class GarrisonWindow(arcade.Window):
         return r
 
     # ── setup ───────────────────────────────────────
-    def _start_game(self):
+    def _start_game(self, strat_id: str = '', difficulty: str = '', map_seed: int = None):
+        if strat_id:
+            for i, s in enumerate(STRATEGIES):
+                if s.id == strat_id: self.setup_strat_idx = i; break
+        if difficulty:
+            diffs = ['入门','标准','险境','绝境','终极']
+            if difficulty in diffs: self.setup_diff_idx = diffs.index(difficulty)
         strat = STRATEGIES[self.setup_strat_idx]
         diffs = ['入门','标准','险境','绝境','终极']
         self.diff = diffs[self.setup_diff_idx]
         self.state = GameState(life=strat.hp, difficulty=self.diff, strategy=strat)
-        self.gmap.generate()
+        self.gmap.generate(map_seed)
         self.waves, self.diff_mult = generate_waves(self.diff)
         self.state.total_waves = len(self.waves)
         self.state.round_num = 1
@@ -693,7 +738,8 @@ class GarrisonWindow(arcade.Window):
 
     # ── battle ──────────────────────────────────────
     def start_battle(self):
-        if not self.state.deployed: self.msg='请至少部署1名干员!'; self.msg_tmr=2.0; return
+        if not self.state.deployed and self.net_mode == 'single':
+            self.msg='请至少部署1名干员!'; self.msg_tmr=2.0; return
         self.phase='battle'; self.b_dp=30; self.b_dp_tmr=0.0
         play_bgm(bgm_battle)
         self.b_killed=self.b_leaked=0; self.b_speed=1.0; self.wave_tmr=0.0
@@ -732,6 +778,13 @@ class GarrisonWindow(arcade.Window):
                             'def':int(t.defense*wave_scale),
                             'speed':t.speed*60,'is_boss':t.is_boss,'is_elite':t.is_elite})
         self.b_total=len(self.wave_q); self.enemies.clear()
+        # 多人Boss: HP按人数缩放
+        if self._boss_mode and self.net_mode in ('host', 'client') and len(self.players) > 1:
+            scale = max(1, len(self.players))
+            for e in self.wave_q:
+                if e.get('is_boss'):
+                    e['hp'] = int(e['hp'] * scale)
+                    e['max_hp'] = int(e['max_hp'] * scale)
         PactLayerEngine.trigger_combat_start(self.state)
         PactLayerEngine.update_activation(self.state)
         # 策略: 重点监护(s1) - 每等阶+2层
@@ -810,7 +863,15 @@ class GarrisonWindow(arcade.Window):
                 # 到达最左(蓝门)?
                 if pid <= 0:
                     e['alive'] = False
-                    self.b_leaked += 1
+                    # 兜底回合: 各自独立防守, 到达终点=漏
+                    if self._backstop_round:
+                        if self._is_backstop_player:
+                            self.b_leaked += 1
+                    else:
+                        self.b_leaked += 1
+                        # 联机: 暂存漏怪用于兜底
+                        if self.net_mode in ('host','client'):
+                            self.leaked_enemies.append(e)
                     play_sfx(sfx_leak)
                     if self.b_leaked <= 3: self.msg = f'漏怪!(-{self.b_leaked}HP)'; self.msg_tmr = 1.5
                     continue
@@ -896,8 +957,67 @@ class GarrisonWindow(arcade.Window):
         play_bgm(bgm_rest)
         # 清除战斗特效
         self.dmg_nums.clear(); self.atk_lines.clear()
-        if self.b_leaked>0: self.state.life -= self.b_leaked
-        if self.state.life<=0: self.phase='gameover'; return
+        # 兜底回合结束
+        if self._backstop_round:
+            if self._is_backstop_player:
+                self._backstop_done = True
+                if self.net_mode in ('host','client'):
+                    self.net.send({'type':'backstop_done','leaked':self.b_leaked,
+                                   'killed':self.b_killed})
+                    if self.net_mode == 'host':
+                        for p in self.players:
+                            if p['id']==0:
+                                p['_bs_done']=True
+                                p['_bs_killed']=self.b_killed
+                                p['_bs_leaked']=self.b_leaked
+                        if all(p.get('_bs_done') for p in self.players if p.get('_is_backstop')):
+                            self._finish_backstop()
+            else:
+                self._is_spectating = False
+                self._backstop_round = False
+            return
+        # Boss关: 漏怪信息通知主机, 暂不扣HP
+        if self._boss_mode and self.b_leaked > 0 and self.net_mode in ('host', 'client'):
+            self.net.send({'type': 'boss_leaked', 'leaked': self.b_leaked, 'player_id': self.player_id})
+        if self._boss_mode and self.net_mode == 'single':
+            self.state.life -= self.b_leaked
+        elif not self._boss_mode:
+            if self.b_leaked>0:
+                if self.net_mode == 'single':
+                    self.state.life -= self.b_leaked
+        if self.state.life <= 0:
+            if self.net_mode in ('host', 'client'):
+                # 联机: 死亡后进入观战, 等待其他玩家
+                self.state.life = 0
+                for p in self.players:
+                    if p['id'] == self.player_id:
+                        p['alive'] = False
+                        p['hp'] = 0
+                self._is_spectating = True
+            else:
+                self.phase = 'gameover'
+                return
+        # 联机: 发送结果(含漏怪记录)
+        if self.net_mode in ('host','client'):
+            self._broadcast_player_hp()
+            leaked_data = []
+            for e in getattr(self, 'leaked_enemies', []):
+                leaked_data.append({'id':e.get('id',''),'hp':e.get('hp',0),'max_hp':e.get('max_hp',0),
+                                    'atk':e.get('atk',0),'def':e.get('def',0),'speed':e.get('speed',0),
+                                    'owner_id':self.player_id if self.net_mode=='client' else 0,
+                                    'is_boss':e.get('is_boss',False),'is_elite':True})
+            self.net.send({'type':'battle_done','killed':self.b_killed,'leaked':self.b_leaked,
+                           'hp':self.state.life,'leaked_enemies':leaked_data,'round':self._multiplayer_round})
+            # 主机: 标记自己已完成
+            if self.net_mode == 'host':
+                for p in self.players:
+                    if p['id']==0:
+                        p['_done']=True
+                        p['leaked']=self.b_leaked
+                # 检查是否所有存活玩家都已完成(跳过阵亡/观战)
+                active = [p for p in self.players if p.get('alive', True)]
+                if active and all(p.get('_done') for p in active):
+                    self._process_post_battle()
         # 被击倒且无复活计时的干员回整备区, 等待复活的留在场上
         for bo in self.b_ops:
             if not bo['alive'] and 'death_timer' not in bo:
@@ -931,6 +1051,17 @@ class GarrisonWindow(arcade.Window):
     def _next_round(self):
         self.state.round_num+=1
         if self.state.round_num>self.state.total_waves: self.phase='gameover'; return
+        # 检测Boss关(最后一轮)
+        if self.state.round_num == self.state.total_waves:
+            self._boss_mode = True
+            self._boss_leaked_total = 0
+            self.msg = '⚠ BOSS关卡! 所有人协力作战!'; self.msg_tmr = 4.0
+            if self.net_mode == 'host':
+                for p in self.players:
+                    if p['id'] != 0:
+                        self.net.send({'type': 'boss_mode', 'active': True}, p['id'])
+        # 清除战斗就绪标记, 下回合需重新准备
+        for p in self.players: p.pop('_br', None)
         # 不更换地图, 保留干员位置
         self.phase='decision'
         play_bgm(bgm_rest)
@@ -960,15 +1091,27 @@ class GarrisonWindow(arcade.Window):
 
     # ── arcade callbacks ────────────────────────────
     def on_update(self, dt):
+        # 网络消息轮询
+        self._handle_net_messages()
+        # 主机广播战斗快照给观战者(每~8帧)
+        if self.net_mode == 'host' and self._backstop_round:
+            self._spec_frame = (self._spec_frame + 1) % 8
+            if self._spec_frame == 0:
+                self._broadcast_battle_snapshot()
         if self.transition_alpha > 0: self.transition_alpha = max(0, self.transition_alpha - dt*1.2)
-        if self.phase=='battle': self._update_battle(dt)
+        if self.phase in ('battle', 'backstop'): self._update_battle(dt)
         elif self.phase=='rest':
             self.rest_tmr+=dt
-            if self.rest_tmr>2.0: self._next_round()
+            if self.net_mode in ('host','client'):
+                pass  # 联机模式: 等待主机广播 phase_change
+            elif self.rest_tmr>2.0:
+                self._next_round()
         elif self.phase=='gameover':
             self.gameover_timer += dt
             if self.gameover_timer > 10.0:
                 self.close()
+        elif self.phase=='lobby':
+            self._handle_net_messages()
         if self.msg_tmr>0: self.msg_tmr-=dt
 
     def on_mouse_motion(self, x, y, dx, dy):
@@ -987,6 +1130,10 @@ class GarrisonWindow(arcade.Window):
     def on_mouse_press(self, x, y, button, modifiers):
         if self.phase == 'setup':
             self._click_setup(x, y); return
+        if self.phase == 'lobby':
+            self._click_lobby(x, y); return
+        if self.phase == 'strat_pick':
+            self._click_strat_pick(x, y); return
         if self.phase == 'gameover':
             self.close(); return
 
@@ -1064,9 +1211,24 @@ class GarrisonWindow(arcade.Window):
                 self.msg = f'调度中心升级! Lv.{self.center_lv}'; self.msg_tmr = 2.0
             else: self.msg = '资金不足或已满级'; self.msg_tmr = 1.5
             return
-        # 开始战斗
+        # 开始战斗(联机/单人)
         if self.phase=='decision' and hit(x, y, SW-70, SH-SHOP_H+SHOP_H-20, 100, 32):
-            self.start_battle(); return
+            if self.net_mode in ('host','client'):
+                self._battle_ready = True
+                self.net.send({'type':'battle_ready'})
+                if self.net_mode == 'host':
+                    for p in self.players:
+                        if p['id']==self.player_id: p['_br']=True
+                    # 检查是否全部就绪(跳过阵亡玩家)
+                    active = [p for p in self.players if p.get('alive', True)]
+                    if len(active) >= 1 and all(p.get('_br') for p in active):
+                        self._broadcast_phase('battle', self._multiplayer_round)
+                        self.phase = 'battle'
+                        self.start_battle()
+                self.msg = '等待其他玩家...'; self.msg_tmr = 3.0
+            else:
+                self.start_battle()
+            return
         # 倍速
         if self.phase=='battle':
             for i, sp in enumerate([1,2,5,8]):
@@ -1124,6 +1286,25 @@ class GarrisonWindow(arcade.Window):
                 self.sell(self.state.bench[idx]); return
 
     def on_key_press(self, key, mod):
+        # 联机IP输入
+        if self.phase == 'lobby' and self._input_mode:
+            if key == arcade.key.ESCAPE:
+                self._input_mode = False
+            elif key == arcade.key.BACKSPACE:
+                self._input_ip = self._input_ip[:-1]
+            elif key == arcade.key.ENTER:
+                self._input_mode = False
+                if self._input_ip.strip():
+                    self.net = NetManager()
+                    self.net.start_client(self._input_ip.strip(), self.host_port)
+                    self.net_mode = 'client'
+                    self.net.send({'type': 'join', 'name': self.player_name})
+            else:
+                # 数字和点
+                ch = chr(key) if 32 <= key <= 127 else ''
+                if ch in '0123456789.':
+                    self._input_ip += ch
+            return
         if key == arcade.key.ESCAPE:
             if self.dir_mode:
                 self.dir_mode = False; self.dir_op = None; self.selected = None
@@ -1164,13 +1345,684 @@ class GarrisonWindow(arcade.Window):
                 self.setup_diff_idx = i; return
         # 开始按钮
         if hit(x, y, SW//2, SH-380, 200, 48):
+            self.net_mode = 'single'
+            self.net = None
             self._start_game(); self.phase='decision'
             play_bgm(bgm_rest)
+            return
+        # 局域网联机按钮
+        if hit(x, y, SW//2, SH-440, 200, 36):
+            self.phase = 'lobby'; self._input_ip = ''; self._input_mode = False
+            play_bgm(bgm_rest)
+            return
+
+    # ── 联机: 大厅 ──────────────────────────────
+    def _click_lobby(self, x, y):
+        # 输入IP模式优先处理(否则与"创建房间"按钮冲突)
+        if self._input_mode:
+            if hit(x, y, SW//2, SH-280, 220, 44):
+                if self._input_ip.strip():
+                    self.net = NetManager()
+                    self.net.start_client(self._input_ip.strip(), self.host_port)
+                    self.net_mode = 'client'
+                    self._input_mode = False
+                    self.net.send({'type': 'join', 'name': self.player_name})
+            elif hit(x, y, SW//2, SH-400, 220, 36):
+                self._input_mode = False
+            return
+
+        # 菜单页(未连接)
+        if self.net_mode == 'single':
+            if hit(x, y, SW//2, SH-280, 220, 44):
+                # 创建房间
+                self.net_mode = 'host'
+                self.net = NetManager()
+                self.net.start_host(self.host_port)
+                self.player_id = 0
+                self.players = [{'id':0,'name':self.player_name,'hp':99,'alive':True,'ready':False}]
+                self.lobby_ready = False
+            elif hit(x, y, SW//2, SH-340, 220, 44):
+                # 加入房间: 进入IP输入模式
+                self._input_mode = not self._input_mode
+                if self._input_mode: self._input_ip = ''
+            elif hit(x, y, SW//2, SH-400, 220, 36):
+                self.phase = 'setup'; self.net_mode = 'single'
+            return
+
+        # 已连接大厅
+        if self.net_mode == 'host':
+            # 难度切换(点击按钮循环)
+            if hit(x, y, SW//2, SH-310, 170, 34):
+                diffs = ['入门','标准','险境','绝境','终极']
+                idx = diffs.index(self.diff) if self.diff in diffs else 1
+                self.diff = diffs[(idx + 1) % len(diffs)]
+                self.setup_diff_idx = diffs.index(self.diff)
+            # 准备/取消
+            if hit(x, y, SW//2-120, SH-350, 110, 40):
+                self.lobby_ready = not self.lobby_ready
+                self.net.send({'type':'player_update','ready':self.lobby_ready,'hp':99})
+                # 更新本地
+                for p in self.players:
+                    if p['id']==0: p['ready']=self.lobby_ready
+            # 开始选策略(全部准备)
+            all_ready = all(p.get('ready') for p in self.players) and len(self.players)>=2
+            if all_ready and hit(x, y, SW//2+120, SH-350, 110, 40):
+                self._strat_picks = {}  # 等所有人选策略
+                self._strat_selected = False
+                self.net.send({'type':'strat_pick_phase','difficulty':self.diff,
+                               'count':len(self.players)})
+                self.phase = 'strat_pick'
+            # 返回
+            if hit(x, y, SW//2, SH-400, 140, 32):
+                self.net.stop(); self.net=None; self.net_mode='single'
+                self.players.clear()
+        elif self.net_mode == 'client':
+            if hit(x, y, SW//2-60, SH-350, 120, 40):
+                self.lobby_ready = not self.lobby_ready
+                self.net.send({'type':'player_update','ready':self.lobby_ready,'hp':99})
+            if hit(x, y, SW//2, SH-400, 140, 32):
+                self.net.stop(); self.net=None; self.net_mode='single'
+                self.players.clear()
+
+    def _draw_lobby(self):
+        rf(SW//2, SH//2, SW, SH, (8,10,14,250))
+
+        # ── 菜单页(未连接) ──
+        if self.net_mode == 'single':
+            txt('局域网联机', SW//2, SH-120, GOLD, 30, bold=True)
+            btn1_h=hit(self.hx,self.hy,SW//2,SH-280,220,44)
+            draw_button(SW//2,SH-280,220,44,'创建房间',btn1_h,BUTTON_BG,GREEN,16,GREEN)
+            btn2_h=hit(self.hx,self.hy,SW//2,SH-340,220,44)
+            if self._input_mode:
+                # IP输入框
+                draw_card(SW//2,SH-340,280,44,False,False,CYAN)
+                txt(f'IP: {self._input_ip}█', SW//2, SH-348, WHITE, 16)
+                btn_conn=hit(self.hx,self.hy,SW//2,SH-280,220,44)
+                draw_button(SW//2,SH-280,220,44,'连接',btn_conn,BUTTON_BG,GREEN,16,GREEN)
+            else:
+                draw_button(SW//2,SH-340,220,44,'加入房间',btn2_h,BUTTON_BG,CYAN,16,CYAN)
+            btn3_h=hit(self.hx,self.hy,SW//2,SH-400,220,36)
+            draw_button(SW//2,SH-400,220,36,'返回',btn3_h,BUTTON_BG,DIM,14,DIM)
+            # IP输入键盘提示
+            if self._input_mode:
+                txt('输入主机IP地址, 然后点击"连接"', SW//2, SH-390, DIM, 12)
+                txt('按 ESC 取消输入', SW//2, SH-410, DIM, 12)
+            return
+
+        # ── 大厅 ──
+        txt('等待玩家...', SW//2, SH-100, GOLD, 26, bold=True)
+        txt(f'玩家: {len(self.players)}/4', SW//2, SH-130, DIM, 14)
+        if self.net_mode == 'host':
+            txt(f'你的IP: {self._get_local_ip()}:{self.host_port}', SW//2, SH-155, DIM, 12)
+
+        # 玩家列表
+        py = SH-200
+        for p in self.players:
+            col = GREEN if p.get('ready') else DIM
+            status = '已准备' if p.get('ready') else '未准备'
+            marker = '▶' if p['id']==self.player_id else ' '
+            label = f'{marker} {p["name"]}  [{status}]'
+            txt(label, SW//2, py, col, 16)
+            py -= 30
+
+        # 难度选择(主机, 点击切换)
+        if self.net_mode == 'host':
+            diff_h=hit(self.hx,self.hy,SW//2,SH-310,170,34)
+            draw_button(SW//2,SH-310,170,34,f'难度: {self.diff} ▼',diff_h,
+                        BUTTON_BG,GOLD,14,GOLD)
+
+        # 按钮 (置于中下)
+        btn_y = SH-350
+        if self.net_mode == 'host':
+            r_h=hit(self.hx,self.hy,SW//2-120,btn_y,110,40)
+            draw_button(SW//2-120,btn_y,110,40,
+                        '取消' if self.lobby_ready else '准备',r_h,BUTTON_BG,
+                        GREEN if self.lobby_ready else DIM,14)
+            all_ok = all(p.get('ready') for p in self.players) and len(self.players)>=2
+            s_h=hit(self.hx,self.hy,SW//2+120,btn_y,110,40)
+            draw_button(SW//2+120,btn_y,110,40,'开始游戏',s_h and all_ok,
+                        (35,95,40,240) if all_ok else BUTTON_BG,
+                        GREEN if all_ok else DIM,14)
+        else:
+            r_h=hit(self.hx,self.hy,SW//2-60,btn_y,120,40)
+            draw_button(SW//2-60,btn_y,120,40,
+                        '取消' if self.lobby_ready else '准备',r_h,BUTTON_BG,
+                        GREEN if self.lobby_ready else DIM,14)
+        b_h=hit(self.hx,self.hy,SW//2,btn_y-50,140,32)
+        draw_button(SW//2,btn_y-50,140,32,'断开',b_h,BUTTON_BG,RED,12)
+
+    def _get_local_ip(self) -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8',80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return '127.0.0.1'
+
+    def _draw_strat_pick(self):
+        """策略选择界面"""
+        rf(SW//2, SH//2, SW, SH, (8,10,14,250))
+        txt('选择你的策略', SW//2, SH-60, GOLD, 26, bold=True)
+        txt(f'难度: {self.diff}', SW//2, SH-95, DIM, 14)
+        # 已选提示
+        if self._strat_selected:
+            my_sid = self._strat_picks.get(self.player_id, '')
+            s = next((st for st in STRATEGIES if st.id==my_sid), None)
+            if s:
+                txt(f'你选择了: {s.name}', SW//2, SH-120, GREEN, 16)
+        txt('点击选择策略(每人不同)', SW//2, SH-670, DIM, 12)
+        # 返回按钮
+        if self.net_mode == 'host':
+            back_h = hit(self.hx, self.hy, SW//2, SH-700, 100, 26)
+            draw_button(SW//2, SH-700, 100, 26, '返回大厅', back_h, BUTTON_BG, DIM, 11, RED)
+        # 策略网格: 4列
+        cols, cw, ch, gap = 4, 260, 90, 16
+        grid_w = cols * cw + (cols-1) * gap
+        start_x = SW//2 - grid_w//2 + cw//2
+        start_y = SH - 160
+        taken_strats = [sid for sid in self._strat_picks.values() if sid]
+        for i, s in enumerate(STRATEGIES):
+            col = i % cols
+            row = i // cols
+            cx = start_x + col * (cw + gap)
+            cy = start_y - row * (ch + gap)
+            is_taken = s.id in taken_strats
+            is_mine = self._strat_picks.get(self.player_id) == s.id
+            bg = (35, 50, 40, 240) if is_mine else ((55, 40, 40, 230) if is_taken else (28, 32, 40, 230))
+            border = GREEN if is_mine else (RED if is_taken else DIVIDER)
+            draw_panel(cx, cy, cw, ch, bg, border)
+            txt(s.name, cx, cy+24, WHITE if not is_taken else DIM, 15)
+            txt(f'{s.initiator}  HP:{s.hp}', cx, cy+6, DIM if is_taken else CYAN, 11)
+            eff = s.effect_desc[:45]
+            txt(eff, cx, cy-12, DIM, 9)
+            if is_taken:
+                owner = next((p['name'] for p in self.players if self._strat_picks.get(p['id'])==s.id), '')
+                txt(f'已选: {owner}', cx, cy-30, RED, 10)
+
+    def _click_strat_pick(self, x, y):
+        """策略选择点击"""
+        # 返回大厅(仅主机)
+        if self.net_mode == 'host' and hit(x, y, SW//2, SH-700, 100, 26):
+            self.net.send({'type':'back_to_lobby'})
+            self.phase = 'lobby'
+            self._strat_picks.clear()
+            self._strat_selected = False
+            return
+        # 检查是否点击策略卡片
+        cols, cw, ch, gap = 4, 260, 90, 16
+        grid_w = cols * cw + (cols-1) * gap
+        start_x = SW//2 - grid_w//2 + cw//2
+        start_y = SH - 160
+        taken_strats = [sid for sid in self._strat_picks.values() if sid]
+        for i, s in enumerate(STRATEGIES):
+            col = i % cols
+            row = i // cols
+            cx = start_x + col * (cw + gap)
+            cy = start_y - row * (ch + gap)
+            half_w, half_h = cw//2, ch//2
+            if cx - half_w <= x <= cx + half_w and cy - half_h <= y <= cy + half_h:
+                if s.id in taken_strats:
+                    self.msg = '该策略已被选择!'; self.msg_tmr = 1.5
+                    return
+                # 选择策略
+                self._strat_picks[self.player_id] = s.id
+                self._strat_selected = True
+                if self.net_mode == 'host':
+                    self._broadcast_strat_picks()
+                    if len(self._strat_picks) == len(self.players):
+                        self._start_game_with_strats()
+                else:
+                    self.net.send({'type':'strat_pick','strategy_id':s.id})
+                self.msg = f'选择了 {s.name}'; self.msg_tmr = 2.0
+                return
+
+    def _start_multiplayer_game(self):
+        self._start_game()
+        self.phase = 'decision'
+        self._multiplayer_round = 1
+        self._battle_ready = False
+        self._waiting_for_players = False
+        # 清除大厅准备状态, 使用单独的战斗就绪字段 _br
+        for p in self.players:
+            p['ready'] = False
+            p.pop('_br', None)
+
+    def _handle_net_messages(self):
+        """在on_update中每帧调用, 处理网络消息"""
+        if not self.net: return
+        for msg in self.net.poll():
+            t = msg.get('type','')
+            # ── 大厅消息 ──
+            if t == 'join' and self.net_mode == 'host':
+                pid = msg.get('_client_id', len(self.players))
+                name = msg.get('name', f'Player{pid}')
+                self.players.append({'id':pid,'name':name,'hp':99,'alive':True,'ready':False})
+                self.net.send({'type':'join_ack','player_id':pid,'players':self.players})
+                self._broadcast_lobby()
+            elif t == 'join_ack' and self.net_mode == 'client':
+                self.player_id = msg.get('player_id', 1)
+            elif t == 'lobby_update':
+                self.players = msg.get('players', [])
+            elif t == 'player_update' and self.net_mode == 'host':
+                cid = msg.get('_client_id', -1)
+                for p in self.players:
+                    if p['id']==cid:
+                        p['ready'] = msg.get('ready', False)
+                        p['hp'] = msg.get('hp', 99)
+                self._broadcast_lobby()
+            elif t == 'strat_pick_phase':
+                # 进入策略选择阶段
+                self._strat_picks = {}
+                self._strat_selected = False
+                self.diff = msg.get('difficulty', '标准')
+                self.phase = 'strat_pick'
+            elif t == 'strat_pick' and self.net_mode == 'host':
+                cid = msg.get('_client_id', -1)
+                sid = msg.get('strategy_id', '')
+                # 检查是否已被选
+                if sid and sid not in self._strat_picks.values():
+                    self._strat_picks[cid] = sid
+                else:
+                    continue  # 跳过, 不处理重复选择
+                # 广播选情
+                self._broadcast_strat_picks()
+                # 检查是否全部选完
+                if len(self._strat_picks) == len(self.players):
+                    self._start_game_with_strats()
+            elif t == 'strat_pick_update':
+                raw = msg.get('picks', {})
+                self._strat_picks = {int(k): v for k, v in raw.items()}
+                self._strat_selected = self.player_id in self._strat_picks
+            elif t == 'game_start':
+                # JSON序列化将int key转成str, 转回int
+                raw = msg.get('strategy_map', {})
+                strat_map = {int(k): v for k, v in raw.items()}
+                diff = msg.get('difficulty','')
+                my_strat = strat_map.get(self.player_id, 's1')
+                map_seed = msg.get('map_seed')
+                self._start_game(my_strat, diff, map_seed)
+                # 更新所有玩家的血量显示
+                for p in self.players:
+                    sid = strat_map.get(p['id'], 's1')
+                    s = next((st for st in STRATEGIES if st.id == sid), None)
+                    if s:
+                        p['hp'] = s.hp
+                # 自身血量取实际值(含策略buff)
+                for p in self.players:
+                    if p['id'] == self.player_id:
+                        p['hp'] = self.state.life
+                self._multiplayer_round = 1
+                self._battle_ready = False
+                self._waiting_for_players = False
+                for p in self.players:
+                    p['ready'] = False
+                    p.pop('_br', None)
+                self.phase = 'decision'
+
+            elif t == 'back_to_lobby':
+                self.phase = 'lobby'
+                self._strat_picks.clear()
+                self._strat_selected = False
+            elif t == 'boss_mode':
+                self._boss_mode = msg.get('active', False)
+                self._boss_leaked_total = 0
+                if self._boss_mode:
+                    self.msg = '⚠ BOSS关卡! 所有人协力作战!'; self.msg_tmr = 4.0
+
+            # ── 游戏同步 ──
+            elif t == 'phase_change':
+                new_phase = msg.get('phase','')
+                if new_phase == 'battle':
+                    self._multiplayer_round = msg.get('round', self._multiplayer_round)
+                    self._battle_ready = False
+                    self.start_battle()
+                elif new_phase == 'decision':
+                    self._multiplayer_round = msg.get('round', self._multiplayer_round)
+                    self._next_round()
+                self.phase = new_phase
+            elif t == 'player_hps':
+                for incoming in msg.get('players', []):
+                    for p in self.players:
+                        if p['id']==incoming['id']:
+                            p.update(incoming)
+                # 更新本地玩家HP
+                my_hp = next((p.get('hp') for p in self.players if p['id']==self.player_id), None)
+                if my_hp is not None:
+                    self.state.life = my_hp
+            elif t == 'battle_ready' and self.net_mode == 'host':
+                cid = msg.get('_client_id', -1)
+                for p in self.players:
+                    if p['id']==cid: p['_br']=True
+                # 检查是否全部就绪(跳过阵亡玩家)
+                active = [p for p in self.players if p.get('alive', True)]
+                if active and all(p.get('_br') for p in active):
+                    self._broadcast_phase('battle', self._multiplayer_round)
+                    self.phase = 'battle'
+                    self._battle_ready = False
+                    self.start_battle()
+            elif t == 'battle_done' and self.net_mode == 'host':
+                cid = msg.get('_client_id', -1)
+                for p in self.players:
+                    if p['id']==cid:
+                        p['hp'] = msg.get('hp', p['hp'])
+                        p['_done'] = True
+                        p['leaked'] = msg.get('leaked', 0)
+                # 暂存漏怪
+                self.leaked_enemies.extend(msg.get('leaked_enemies', []))
+                # 检查是否全部完成
+                if all(p.get('_done') for p in self.players):
+                    self._process_post_battle()
+            elif t == 'backstop_start':
+                self._backstop_round = True
+                self._is_backstop_player = msg.get('is_backstop', False)
+                self._backstop_enemies = msg.get('enemies', [])
+                self._backstop_chain = msg.get('backstop_ids', [])
+                self._is_spectating = not self._is_backstop_player
+                if self._is_backstop_player:
+                    self._start_backstop_round()
+            elif t == 'backstop_done' and self.net_mode == 'host':
+                cid = msg.get('_client_id', -1)
+                for p in self.players:
+                    if p['id']==cid:
+                        p['_bs_done']=True
+                        p['_bs_killed']=msg.get('killed', 0)
+                        p['_bs_leaked']=msg.get('leaked', 0)
+                if all(p.get('_bs_done') for p in self.players if p.get('_is_backstop')):
+                    self._finish_backstop()
+            elif t == 'backstop_result':
+                # 应用最终HP (JSON序列化转int key)
+                raw = msg.get('hps', {})
+                hps = {int(k): v for k, v in raw.items()}
+                me_id = self.player_id
+                if hps and me_id in hps:
+                    self.state.life = hps[me_id].get('hp', self.state.life)
+                for p in self.players:
+                    pid = p['id']
+                    if pid in hps:
+                        p['hp'] = hps[pid]['hp']
+                        p['alive'] = hps[pid]['alive']
+                self._backstop_round = False
+                self._is_backstop_player = False
+                self._is_spectating = False
+                self._backstop_enemies = []
+                self._backstop_chain = []
+                self._spec_enemies.clear()
+                self._spec_operators.clear()
+                # 等待 phase_change{decision} 推进
+            elif t == 'boss_leaked' and self.net_mode == 'host':
+                # 某玩家的Boss漏了: 记入总数
+                leaked = msg.get('leaked', 1)
+                self._boss_leaked_total += leaked
+            elif t == 'battle_snapshot':
+                # 观战: 接收主机战斗快照
+                self._spec_enemies = msg.get('enemies', [])
+                self._spec_operators = msg.get('operators', [])
+                self._spec_killed = msg.get('killed', 0)
+                self._spec_total = msg.get('total', 0)
+
+            # ── 通用 ──
+            elif t == 'disconnect':
+                cid = msg.get('client_id', -1)
+                self.players = [p for p in self.players if p['id']!=cid]
+                self.msg = f'玩家{cid}断开连接!'; self.msg_tmr = 3.0
+            elif t == 'connect_error':
+                self.msg = f'连接失败: {msg.get("error","")}'; self.msg_tmr = 5.0
+                self.net_mode = 'single'
+            elif t == 'gameover':
+                self.phase = 'gameover'
+                self.players = msg.get('players', self.players)
+
+    def _broadcast_lobby(self):
+        self.net.send({'type':'lobby_update','players':self.players})
+
+    def _broadcast_phase(self, phase: str, round_num: int):
+        self.net.send({'type':'phase_change','phase':phase,'round':round_num})
+
+    def _broadcast_strat_picks(self):
+        """广播选情"""
+        self.net.send({'type':'strat_pick_update','picks':self._strat_picks})
+
+    def _start_game_with_strats(self):
+        """所有玩家选完策略, 开始游戏"""
+        strat_map = dict(self._strat_picks)
+        for p in self.players:
+            pid = p['id']
+            if pid not in strat_map:
+                strat_map[pid] = 's1'
+        map_seed = random.randint(0, 999999)
+        self.net.send({'type':'game_start','strategy_map':strat_map,
+                       'difficulty':self.diff, 'map_seed':map_seed})
+        self._start_game(strat_map.get(0, 's1'), self.diff, map_seed)
+        # 更新所有玩家的血量显示
+        for p in self.players:
+            sid = strat_map.get(p['id'], 's1')
+            s = next((st for st in STRATEGIES if st.id == sid), None)
+            if s:
+                p['hp'] = s.hp
+        # 主机自身血量取实际值(含策略buff)
+        for p in self.players:
+            if p['id'] == self.player_id:
+                p['hp'] = self.state.life
+        self._multiplayer_round = 1
+        self._battle_ready = False
+        self._waiting_for_players = False
+        for p in self.players:
+            p['ready'] = False
+            p.pop('_br', None)
+        self.phase = 'decision'
+
+    def _broadcast_battle_snapshot(self):
+        """主机在兜底回合广播战斗快照给观战者"""
+        if not self._backstop_round or not self.enemies: return
+        enemies = []
+        for e in self.enemies:
+            enemies.append({'x':e['x'],'y':e['y'],'hp':e['hp'],'max_hp':e['max_hp'],
+                           'alive':e['alive'],'is_boss':e.get('is_boss',False),
+                           'is_elite':e.get('is_elite',True),'name':e.get('name','')})
+        ops = []
+        for bo in self.b_ops:
+            ops.append({'gx':bo['gx'],'gy':bo['gy'],'hp':bo['hp'],'max_hp':bo['max_hp'],
+                       'alive':bo['alive'],'name':bo['op'].name[:4],
+                       'is_elite':bo['op'].is_elite,'block_count':bo['op'].block_count,
+                       'healer':bo['op'].healer})
+        snapshot = {'type':'battle_snapshot','enemies':enemies,'operators':ops,
+                    'killed':self.b_killed,'total':self.b_total}
+        for p in self.players:
+            if p['id'] != 0 and not p.get('_is_backstop'):
+                self.net.send(snapshot, p['id'])
+
+    def _broadcast_player_hp(self):
+        if not self.net or self.net_mode=='single': return
+        me = next((p for p in self.players if p['id']==self.player_id), None)
+        if me:
+            me['hp'] = self.state.life
+            self.net.send({'type':'player_hps','players':[{'id':self.player_id,'hp':self.state.life,'alive':self.state.life>0}]})
+
+    def _process_post_battle(self):
+        """所有人战斗结束: 处理兜底或进入下一回合"""
+        # 清除done标记
+        for p in self.players: p.pop('_done', None)
+
+        # 检查是否全部阵亡
+        if all(not p.get('alive', True) for p in self.players):
+            self._broadcast_player_hp()
+            self.net.send({'type': 'gameover', 'players': self.players})
+            self.phase = 'gameover'
+            return
+
+        # Boss关: 扣全体HP → 结算
+        if self._boss_mode:
+            # 主机自己的漏怪不经过boss_leaked消息, 手动累加
+            for p in self.players:
+                if p['id'] == 0:
+                    self._boss_leaked_total += p.get('leaked', 0)
+            if self._boss_leaked_total > 0:
+                dmg = self._boss_leaked_total * 5
+                for p in self.players:
+                    p['hp'] = max(0, p['hp'] - dmg)
+                    if p['hp'] <= 0:
+                        p['alive'] = False
+                self._boss_leaked_total = 0
+            self.leaked_enemies.clear()
+            for p in self.players: p.pop('leaked', None)
+            # 同步最终HP到所有客户端
+            self._broadcast_player_hp()
+            self.net.send({'type': 'gameover', 'players': self.players})
+            self.phase = 'gameover'
+            return
+
+        # 按漏怪数排序, 选漏最少的玩家兜底(最多2人)
+        sorted_players = sorted(self.players, key=lambda p: p.get('leaked', 0))
+        non_leakers = [p for p in sorted_players if p.get('leaked', 0) == 0]
+        # 如果所有人都有漏怪, 选漏最少的
+        if not non_leakers:
+            non_leakers = sorted_players[:min(2, len(sorted_players))]
+        if self.leaked_enemies and non_leakers:
+            # 所有兜底玩家独立防守同一批敌人, 接力链改为共同防守
+            backstop_ids = [p['id'] for p in non_leakers[:2]]
+            self._backstop_chain = backstop_ids
+            for p in self.players:
+                p['_is_backstop'] = p['id'] in backstop_ids
+            # 分别发送兜底信息给每个玩家(含自己), 所有兜底玩家收到相同敌人列表
+            host_is_backstop = 0 in backstop_ids
+            for p in self.players:
+                if p['id'] == 0: continue
+                is_bs = p['id'] in backstop_ids
+                self.net.send({'type':'backstop_start','backstop_ids':backstop_ids,
+                              'enemies':self.leaked_enemies,'is_backstop':is_bs,
+                              'player_id':p['id']}, p['id'])
+            self._is_backstop_player = host_is_backstop
+            self._backstop_enemies = list(self.leaked_enemies)
+            self._is_spectating = not host_is_backstop
+            self._start_backstop_round()
+        else:
+            self.leaked_enemies.clear()
+            # 无兜底: 所有漏怪照扣HP
+            for p in self.players:
+                leak = p.pop('leaked', 0)
+                if leak > 0:
+                    p['hp'] = max(0, p.get('hp', 99) - leak)
+                    if p['hp'] <= 0:
+                        p['alive'] = False
+            # 主机自己的HP同步更新
+            me = next((p for p in self.players if p['id']==0), None)
+            if me:
+                self.state.life = me['hp']
+            # 广播所有玩家HP
+            self.net.send({'type':'player_hps','players':[{'id':p['id'],'hp':p['hp'],'alive':p['alive']} for p in self.players]})
+            # 直接下一回合
+            self._multiplayer_round += 1
+            self._broadcast_phase('decision', self._multiplayer_round)
+            self._next_round()
+            self.phase = 'decision'
+
+    def _start_backstop_round(self):
+        """启动兜底回合(主机/客户端)"""
+        self.phase = 'backstop'
+        self._backstop_round = True
+        self.b_ops.clear()
+        self.enemies.clear()
+        self.b_killed = 0
+        self.b_leaked = 0
+        self.b_dp = 30
+        self.b_dp_tmr = 0.0
+        self.all_spawned = False
+        self.dmg_nums.clear()
+        self.atk_lines.clear()
+        if self._is_backstop_player:
+            # 部署当前场上已部署干员
+            self.wave_q = []
+            for e_data in self._backstop_enemies:
+                self.wave_q.append({
+                    'id': e_data.get('id','elite'),
+                    'hp': e_data.get('hp', 2000),
+                    'max_hp': e_data.get('max_hp', 2000),
+                    'atk': e_data.get('atk', 200),
+                    'def': e_data.get('def', 50),
+                    'speed': e_data.get('speed', 30),
+                    'is_boss': False, 'is_elite': True,
+                    'owner_id': e_data.get('owner_id', 0),
+                    'caught': False,
+                })
+            self.b_total = len(self.wave_q)
+            # 将已部署干员加入战斗
+            for op in self.state.deployed:
+                for x in range(COLS):
+                    for y in range(ROWS):
+                        c = self.gmap.get_cell(x,y)
+                        if c and c.occupied and c.operator_id==op.uid:
+                            bo = {'op':op,'gx':x,'gy':y,
+                                  'hp':op.hp,'max_hp':op.hp,
+                                  'atk':op.atk,'def':op.defense,
+                                  'timer':0.0,'alive':True,
+                                  'range':self._calc_range(x,y,op),
+                                  'atk_spd':op.atk_speed}
+                            self.b_ops.append(bo)
+                            break
+            self.msg = f'兜底回合! 消灭所有漏怪!'; self.msg_tmr = 3.0
+
+    def _finish_backstop(self):
+        """兜底结束(主机) — 计算哪些漏怪被接住, 哪些真正漏了"""
+        if not self._backstop_enemies:
+            self._backstop_round = False
+            self.leaked_enemies.clear()
+            for p in self.players:
+                p.pop('_is_backstop', None); p.pop('_bs_done', None)
+                p.pop('_bs_killed', None); p.pop('_bs_leaked', None)
+            self._multiplayer_round += 1
+            self._next_round()
+            self._broadcast_phase('decision', self._multiplayer_round)
+            return
+
+        total_backstop = len(self._backstop_enemies)
+        # 汇总所有兜底玩家的击杀数
+        total_killed = sum(p.get('_bs_killed', 0) for p in self.players if p.get('_is_backstop'))
+        actual_leaked = max(0, total_backstop - total_killed)
+
+        if actual_leaked > 0:
+            # 谁漏的多谁承担更多
+            owner_counts = {}
+            for e in self._backstop_enemies:
+                owner = e.get('owner_id', 0)
+                owner_counts[owner] = owner_counts.get(owner, 0) + 1
+            sorted_owners = sorted(owner_counts.items(), key=lambda x: -x[1])
+            remaining = actual_leaked
+            for owner, count in sorted_owners:
+                take = min(count, remaining)
+                for p in self.players:
+                    if p['id'] == owner:
+                        p['hp'] = max(0, p['hp'] - take)
+                remaining -= take
+                if remaining <= 0:
+                    break
+            # 同步主机自己的state.life
+            me = next((p for p in self.players if p['id']==0), None)
+            if me:
+                self.state.life = me['hp']
+
+        # 通知所有玩家(含最终HP)
+        hp_snapshot = {p['id']: {'hp': p.get('hp', 99), 'alive': p.get('alive', True)}
+                       for p in self.players}
+        self.net.send({'type': 'backstop_result', 'hps': hp_snapshot,
+                       'restored': {}, 'deducted': {}})
+        self._backstop_round = False
+        self.leaked_enemies.clear()
+        self._backstop_chain = []
+        for p in self.players:
+            p.pop('_is_backstop', None); p.pop('_bs_done', None)
+            p.pop('_bs_killed', None); p.pop('_bs_leaked', None)
+        self._multiplayer_round += 1
+        self._next_round()
+        self._broadcast_phase('decision', self._multiplayer_round)
 
     # ── draw ────────────────────────────────────────
     def on_draw(self):
         self.clear(BG)
         if self.phase == 'setup': self._draw_setup(); return
+        if self.phase == 'lobby': self._draw_lobby(); return
+        if self.phase == 'strat_pick': self._draw_strat_pick(); return
         if self.phase == 'gameover': self._draw_gameover(); return
         self._draw_map()
         # 战斗中可以跳过静态UI
@@ -1178,6 +2030,12 @@ class GarrisonWindow(arcade.Window):
         self._draw_top()
         if self.phase != 'battle' or not self._grid_drawn:
             self._draw_shop()
+        # 联机玩家列表
+        if self.net_mode in ('host','client'):
+            self._draw_player_hud()
+        # 兜底/观战
+        if self._backstop_round:
+            self._draw_backstop_ui()
         # 过渡遮罩
         if self.transition_alpha > 0:
             a = int(self.transition_alpha * 180)
@@ -1234,6 +2092,10 @@ class GarrisonWindow(arcade.Window):
         btn_h = hit(self.hx, self.hy, SW//2, SH-380, 220, 52)
         draw_button(SW//2, SH-380, 220, 52, '开始模拟', btn_h,
                     (35, 95, 40, 240), GREEN, 20, GREEN)
+        # 联机按钮
+        btn2_h = hit(self.hx, self.hy, SW//2, SH-440, 220, 36)
+        draw_button(SW//2, SH-440, 220, 36, '局域网联机', btn2_h,
+                    (40, 60, 120, 240), CYAN, 14, CYAN)
 
     def _draw_gameover(self):
         won = self.state.life > 0
@@ -1269,8 +2131,8 @@ class GarrisonWindow(arcade.Window):
             rf(OX+lx*CS+CS//2, OY+ly*CS+CS//2, CS-2, CS-2, C_GOAL)
             txt('守', OX+lx*CS+CS//2, OY+ly*CS+CS//2-8, BLUE, 15)
 
-        # 已部署干员
-        ops_source = self.b_ops if self.phase=='battle' else []
+        # 已部署干员 (观战时从快照渲染)
+        ops_source = self._spec_operators if (self._is_spectating and self._spec_operators) else (self.b_ops if self.phase=='battle' else [])
         if not ops_source:
             # decision phase: show from state
             for x in range(COLS):
@@ -1287,6 +2149,12 @@ class GarrisonWindow(arcade.Window):
                                 break
 
         for bo in ops_source:
+            # 兼容两种格式: 正常(bo['op'] dataclass) 和 快照(bo自身dict)
+            is_snap = 'op' not in bo
+            _name = (bo.get('name','???') if is_snap else bo['op'].name[:4])
+            _elite = bo.get('is_elite', False) if is_snap else bo['op'].is_elite
+            _bc = bo.get('block_count', 0) if is_snap else bo['op'].block_count
+            _healer = bo.get('healer', False) if is_snap else bo['op'].healer
             px, py = OX+bo['gx']*CS+CS//2, OY+bo['gy']*CS+CS//2
             if not bo['alive']:
                 arcade.draw_circle_filled(px, py, 22, (80,80,80))
@@ -1294,22 +2162,21 @@ class GarrisonWindow(arcade.Window):
                 if 'death_timer' in bo:
                     rf(px, py-2, 40, 18, (40,10,10))
                     txt(f'{bo["death_timer"]:.0f}s', px, py-4, RED, 16)
-                txt(bo['op'].name[:3], px, py+24, (120,120,120), 9)
+                txt(_name[:3], px, py+24, (120,120,120), 9)
                 continue
-            col = GOLD if bo['op'].is_elite else (CYAN if bo['op'].block_count>0 else PURPLE)
+            col = GOLD if _elite else (CYAN if _bc>0 else PURPLE)
             arcade.draw_circle_filled(px, py, 22, col)
-            # 边框: 近战蓝, 奶妈绿, 其余青
-            border_c = BLUE if bo['op'].block_count>0 else (GREEN if bo['op'].healer else CYAN)
+            border_c = BLUE if _bc>0 else (GREEN if _healer else CYAN)
             arcade.draw_circle_outline(px, py, 22, border_c, 2)
-            # HP条(渐变: 绿>黄>红)
             hp_pct = bo['hp']/bo['max_hp']; bw = CS-8
             hp_c = GREEN if hp_pct>0.5 else (YELLOW if hp_pct>0.25 else RED)
             rf(px, py-28, bw, 5, RED)
             rf(px-(bw-int(bw*hp_pct))//2, py-28, int(bw*hp_pct), 5, hp_c)
-            txt(bo['op'].name[:4], px, py-18, WHITE, 8)
+            txt(_name[:4], px, py-18, WHITE, 8)
 
-        # 敌人
-        for e in self.enemies:
+        # 敌人 (观战时从快照渲染)
+        enemy_list = self._spec_enemies if self._is_spectating else self.enemies
+        for e in enemy_list:
             if not e['alive']: continue
             col = GOLD if e.get('is_boss') else (RED if e.get('is_elite') else (210,70,60))
             r = 14 if e.get('is_boss') else (11 if e.get('is_elite') else 8)
@@ -1469,6 +2336,37 @@ class GarrisonWindow(arcade.Window):
         if overflow > 0:
             txt(f'+{overflow}', ax + 90, TOP_H//2, DIM, 10, 'right')
 
+    def _draw_player_hud(self):
+        """右侧联机玩家HP面板"""
+        if not self.players: return
+        px = SW - 100
+        py = SH - 200
+        draw_panel(px, py + 15 * len(self.players), 180, 30 * len(self.players) + 20,
+                   (15, 18, 24, 230), DIVIDER)
+        txt('玩家 HP', px, py + 25 * len(self.players) + 10, GOLD, 11)
+        for i, p in enumerate(self.players):
+            col = GREEN if p.get('alive', True) else RED
+            marker = '▶' if p['id'] == self.player_id else ' '
+            hp = p.get('hp', 99)
+            hp_str = f'{"+" if hp>0 else "x"} {max(0,hp)}'
+            txt(f'{marker} {p["name"]} {hp_str}', px, py - i*24, col, 13)
+
+    def _draw_backstop_ui(self):
+        """兜底回合/观战 UI"""
+        if self._is_backstop_player:
+            # 兜底玩家: 画布上方提示
+            draw_panel(SW//2, SH-30, 400, 28, (60, 20, 20, 230), RED)
+            bs_text = f'兜底回合 {self.b_killed}/{self.b_total}'
+            txt(bs_text, SW//2, SH-38, GOLD, 14)
+        elif self._is_spectating:
+            # 观战: 角落标记 + 击杀进度
+            draw_panel(70, SH-26, 180, 22, (15, 18, 24, 220), GOLD)
+            txt(f'👁 观战中 {self._spec_killed}/{self._spec_total}', 70, SH-33, GOLD, 11)
+            backstop_names = [p['name'] for p in self.players if p.get('_is_backstop')]
+            if backstop_names:
+                draw_panel(70, SH-50, 200, 20, (15, 18, 24, 200), DIVIDER)
+                txt(f'兜底: {", ".join(backstop_names)}', 70, SH-56, CYAN, 10)
+
     def _draw_shop(self):
         st = SH - SHOP_H
         draw_panel(SW//2, st + SHOP_H//2, SW, SHOP_H, PANEL_BG, DIVIDER)
@@ -1575,8 +2473,15 @@ class GarrisonWindow(arcade.Window):
         # 战斗/倍速
         if self.phase == 'decision':
             bh = hit(self.hx, self.hy, SW-70, st+SHOP_H-20, 100, 32)
-            draw_button(SW-70, st+SHOP_H-20, 100, 32, '开始战斗', bh,
-                        (35, 95, 35, 240), GREEN, 14, GREEN)
+            btn_text = '开始战斗'
+            btn_col = (35, 95, 35, 240)
+            if self.net_mode in ('host','client'):
+                if self._battle_ready:
+                    btn_text = '已准备'; btn_col = (60, 60, 60, 240)
+                else:
+                    btn_text = '准备战斗'; btn_col = (45, 70, 120, 240)
+            draw_button(SW-70, st+SHOP_H-20, 100, 32, btn_text, bh,
+                        btn_col, GREEN, 14, GREEN)
         if self.phase == 'battle':
             txt(f'DP: {self.b_dp}', MAP_L+240, by-6, BLUE, 20, 'left', font=NUM_FONT)
             for i, sp in enumerate([1, 2, 5, 8]):
@@ -1589,11 +2494,33 @@ class GarrisonWindow(arcade.Window):
                             GOLD if active else None)
 
 
-def run_arcade(difficulty='标准', strategy_id='s1'):
+def run_arcade(difficulty='标准', strategy_id='s1',
+               host=False, connect='', player_name='', port=5555):
     game = GarrisonWindow()
     game.setup_strat_idx = next((i for i,s in enumerate(STRATEGIES) if s.id==strategy_id), 0)
     game.setup_diff_idx = {'入门':0,'标准':1,'险境':2,'绝境':3,'终极':4}.get(difficulty, 1)
-    # 显示设置界面, 不直接开始
+    game.strat_id = STRATEGIES[game.setup_strat_idx].id
     game.phase = 'setup'
+    # CLI联机模式
+    if host or connect:
+        if player_name:
+            game.player_name = player_name
+        game.host_port = port
+        if host:
+            game.phase = 'lobby'
+            game.net_mode = 'host'
+            game.net = NetManager()
+            game.net.start_host(port)
+            game.player_id = 0
+            game.lobby_ready = False
+            game.players = [{'id':0,'name':game.player_name,'hp':99,'alive':True,'ready':False}]
+        elif connect:
+            game.phase = 'lobby'
+            game._input_ip = connect
+            game._input_mode = False
+            game.net = NetManager()
+            game.net.start_client(connect, port)
+            game.net_mode = 'client'
+            game.net.send({'type': 'join', 'name': game.player_name})
     arcade.run()
     return game.state
